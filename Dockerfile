@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /lab
 
+# Copy relevant files into container
+COPY . /lab
+
 RUN git clone https://github.com/saitoha/libsixel.git && \
     cd libsixel && \
     git checkout v1.8.6
