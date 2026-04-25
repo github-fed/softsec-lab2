@@ -19,10 +19,10 @@ RUN git clone https://github.com/saitoha/libsixel.git && \
 # Build 1: White-box (we can try afl-clang-lto)
 RUN cd libsixel && \
     make distclean || true && \
-    CC=afl-clang-fast \ 
+    CC=afl-clang-fast \
     CFLAGS="-fsanitize=address -g -O1" \
     LDFLAGS="-fsanitize=address" \
-    ./configure --disable-shared --prefix=/lab/libsixel-inst && \
+    ./configure --disable-shared --disable-python --prefix=/lab/libsixel-inst && \
     make -j$(nproc) && \
     make install
 
@@ -31,7 +31,7 @@ RUN cd libsixel && \
     make distclean && \
     CC=clang \
     CFLAGS="-g -O1" \
-    ./configure --disable-shared --prefix=/lab/libsixel-vanilla && \
+    ./configure --disable-shared --disable-python --prefix=/lab/libsixel-vanilla && \
     make -j$(nproc) && \
     make install
 
