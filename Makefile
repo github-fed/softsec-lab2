@@ -49,22 +49,22 @@ build-persistent: src/harness_persistent.c
 
 # Smoke test
 fuzz-test:
-	afl-fuzz -V 60 -i seeds -o findings-test -- ./harness_inst @@
-	afl-fuzz -V 60 -Q -i seeds -o findings-test-qemu -- ./harness_vanilla @@
-	afl-fuzz -V 60 -i seeds -o findings-test-persistent -- ./harness_persistent
-	afl-fuzz -V 60 -i seeds -o findings-test-no-asan -- ./harness_no_asan @@
+	afl-fuzz -V 60 -i seeds -o findings-test -x sixel.dict -- ./harness_inst @@
+	afl-fuzz -V 60 -Q -i seeds -o findings-test-qemu -x sixel.dict -- ./harness_vanilla @@
+	afl-fuzz -V 60 -i seeds -o findings-test-persistent -x sixel.dict -- ./harness_persistent
+	afl-fuzz -V 60 -i seeds -o findings-test-no-asan -x sixel.dict -- ./harness_no_asan @@
 
 # Standard coverage-guided fuzzing
 fuzz:
-	afl-fuzz -V 2400 -i seeds -o findings -- ./harness_inst @@
+	afl-fuzz -V 2400 -i seeds -o findings -x sixel.dict -- ./harness_inst @@
 
 # Binary-only fuzzing using QEMU mode
 fuzz-qemu:
-	afl-fuzz -V 2400 -Q -i seeds -o findings-qemu -- ./harness_vanilla @@
+	afl-fuzz -V 2400 -Q -i seeds -o findings-qemu -x sixel.dict -- ./harness_vanilla @@
 
 # Persistent mode fuzzing — short run, used only to record exec speed for Q8
 fuzz-persistent:
-	afl-fuzz -V 300 -i seeds -o findings-persistent -- ./harness_persistent
+	afl-fuzz -V 300 -i seeds -o findings-persistent -x sixel.dict -- ./harness_persistent
 
 ### Analysis and cleanup
 

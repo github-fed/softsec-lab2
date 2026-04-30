@@ -1,0 +1,38 @@
+# DCS header sequences (Device Control String)
+header_pq="\x1bPq"
+header_p="\x1bP"
+
+# String Terminator — ends the Sixel stream
+terminator="\x1b\\"
+
+# Color introducer — starts a palette entry (#id;mode;c1;c2;c3) or selects a color (#id)
+color_intro="#"
+
+# Raster attributes — sets aspect ratio and optional canvas size ("Pan;Pad;Ph;Pv)
+raster_attr="\""
+
+# Run-length encoding — repeats the next sixel character N times (!N<sixel>)
+rle_intro="!"
+
+# Graphics carriage return — resets column to 0, stays on same sixel row
+graphics_cr="$"
+
+# Graphics newline — advances to the next sixel band (6 pixels down)
+graphics_nl="-"
+
+# Parameter separator inside color definitions and raster attributes
+param_sep=";"
+
+# Color coordinate modes
+mode_hls="1"
+mode_rgb="2"
+
+# Boundary sixel pixel values (subtract 0x3F to get the 6-bit pixel mask)
+# 0x3F = 63 → mask 0b000000 — no pixels set
+sixel_empty="?"
+# 0x7E = 126 → mask 0b111111 — all six pixels set
+sixel_full="~"
+# 0x40 = 64 → mask 0b000001 — only top pixel set
+sixel_top="@"
+# 0x7F is not valid (DEL); 0x60 = 96 → mask 0b100001
+sixel_ends="`"
