@@ -1,14 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <sixel.h>
 
 __AFL_FUZZ_INIT();
 
 int main() {
-    unsigned char *buf = __AFL_FUZZ_TESTCASE_BUF;
-
     // Deferred forkserver
     __AFL_INIT();
+
+    unsigned char *buf = __AFL_FUZZ_TESTCASE_BUF;
     
     while (__AFL_LOOP(1000)) {
         int len = __AFL_FUZZ_TESTCASE_LEN;

@@ -12,10 +12,9 @@ int main(int argc, char **argv) {
     size_t size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    // Prevent uninterestingly large inputs from slowing the fuzzer
-    if (size > 1000000) { 
+    if (size == 0 || size > 1000000) {
         fclose(f);
-        return 0; 
+        return 0;
     }
 
     unsigned char *data = malloc(size);

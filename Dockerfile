@@ -19,7 +19,7 @@ RUN git clone https://github.com/saitoha/libsixel.git && \
 # Build 1: White-box (we can try afl-clang-lto)
 RUN cd libsixel && \
     make distclean || true && \
-    CC=afl-clang-fast \
+    CC=afl-clang-lto \
     CFLAGS="-fsanitize=address -g -O1" \
     LDFLAGS="-fsanitize=address" \
     ./configure --disable-shared --disable-python --prefix=/lab/libsixel-inst && \
@@ -35,7 +35,8 @@ RUN cd libsixel && \
     make -j$(nproc) && \
     make install
 
-# Artifacts
-RUN mkdir -p /lab/src /lab/seeds /lab/findings /lab/findings-qemu
+# Generate seed corpus and create artifact directories
+RUN python3 /lab/seeds/gen_seeds.py && \
+    mkdir -p /lab/findings /lab/findings-qemu
 
 ENTRYPOINT ["/bin/bash"]
