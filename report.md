@@ -34,6 +34,30 @@ So we have decided on ```sixel_decode_raw()``` as our fuzzing target since it is
 
 ## Q5 Crash Triage
 
+Crashes found:
+The `harness_load_image` campaign produced 4 crash files. After triage with ASan, all 4 reduce to a **single unique bug** (identical call stack and sanitizer output).
+
+Bug: uninitialized `rows` variable in `load_png`
+- **File / line**: `libsixel/src/loader.c:633`
+- **Sanitizer**: AddressSanitizer reports `bad-free` (free on a pointer
+  that was not returned by `malloc`).
+- **Trigger**: any malformed PNG that causes libpng to fail decoding
+  (e.g. corrupted IDAT). Minimal PoC: 60 bytes.
+- **CWE**: CWE-457 (Use of Uninitialized Variable), with secondary
+  CWE-755 and CWE-761.
+
+Root cause :
+In `load_png()`, the local variable `unsigned char **rows` is declared without `volatile` and without initializer. Two `setjmp` calls capture state early in the function. When libpng later detects the malformed PNG, it triggers a `longjmp` back to one of these `setjmp` sites. Per C11 §7.13.2.1, the value of a non-`volatile` local modified between `setjmp` and `longjmp` is **indeterminate** after the longjmp. In practice GCC keeps `rows` in a register, so the longjmp restores it to its initial **uninitialized** stack value (residue from a previous call frame). The `cleanup` label then calls
+`sixel_allocator_free(allocator, rows)` on that garbage pointer.
+
+The maintainers were aware of the issue: a
+`#pragma GCC diagnostic ignored "-Wclobbered"` directly precedes the declaration of `rows`, silencing the compiler warning instead of fixing the bug.
+
+Suggested fix :
+```diff
+-    unsigned char **rows;
++    unsigned char ** volatile rows = NULL;
+
 ## Q6 Attack Surface Analysis
 
 ## Q7 Binary-Only Fuzzing with QEMU Mode 
