@@ -87,12 +87,22 @@ from a previous call frame). The `cleanup` label then calls
 
 ### Two real world applications
 
-Some projects use libsixel. For instance, Neofetch, a widely used project
-(although archived by its creator) use it to display an image in the terminal
-alongside general information about one's system.
+`img2sixel` is a command-line utility provided directly by the
+libsixel project itself. It converts image formats like PNG, JPEG or BMP
+into SIXEL format so they can be displayed in the terminal.
 
-There are a few other random projects allowing a much wider use of the terminal
-that use libsixel. For example, a project called Green PDF Viewer allows one to
-display a PDF file in a terminal.
+Another application could be FFmpeg-SIXEL. A collection of libraries and tools
+to process multimedia content such as audio, video, subtitles and related
+metadata. It allows for instance for youtube streaming in the terminal.
 
 ### Concrete attack scenario
+
+In unsecure remote environments, one coud have arbitrary code execution because
+of the bad-free. The attacker can craft an image that forces libsixel to
+allocate memory in a predictable pattern. When the bad-free is triggered, the
+allocator can be tricked into writing data into a location it shouldn't (for
+intance a function pointer). At this point, when the library returns, it will go
+to a location controlled by the attacker which could launch a shellcode, for
+instance.
+
+### Two unexercised code paths
