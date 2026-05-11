@@ -48,6 +48,78 @@ would still be interesting fuzzing targets for the above-mentioned reasons.
 ## Q2 Instrumentation and Sanitizers
 
 
+### Build 1 instrumented (white-box, AFL++ + ASan)
+
+```
+CC=afl-clang-lto
+CFLAGS="-fsanitize=address -g -O1"
+LDFLAGS="-fsanitize=address"
+./configure --disable-shared --disable-python --prefix=/lab/libsixel-inst
+```
+
+| Flag | What it does | If omitted |
+|------|--------------|------------|
+| `CC=afl-clang-lto` | AFL++ instrumentation at link time via LLVM LTO: 
+collision-free edge IDs in every basic block of libsixel. | No coverage 
+feedback → AFL degenerates into blind random fuzzing; `paths_found` stays near 0. |
+
+| `-fsanitize=address` (CFLAGS) | Compiles with ASan: red-zones around 
+allocs, shadow memory, quarantine on free. | Heap OOB / UAF / double-free 
+would silently corrupt memory without crashing → AFL never saves them under 
+`crashes/`. |
+
+| `-fsanitize=address` (LDFLAGS) | Links the ASan runtime (`libclang_rt.asan`)
+ and its `malloc`/`free` interceptors. | Undefined references at link time, 
+ or binary runs without the runtime active. |
+
+| `-g` | DWARF debug info. | ASan stack traces show raw addresses only; 
+triage with `addr2line` becomes painful. |
+
+| `-O1` | Light optimization. | `-O0` bloats the edge map and slows `exec/s`; 
+`-O2/-O3` inlines aggressively → some edges vanish and crashes become 
+non-reproducible between builds. |
+
+| `--disable-shared` | Produces only `libsixel.a`. | A `.so` loaded dynamically
+ bypasses AFL's shm map → 0 % coverage inside libsixel. |
+
+| `--disable-python` | Skips the Python bindings. | Build fails 
+(no `python-dev` in the container) and pollutes the archive with unrelated code. |
+
+### Build 2 — vanilla (black-box, QEMU mode)
+
+```
+CC=clang
+CFLAGS="-g -O1"
+./configure --disable-shared --disable-python --prefix=/lab/libsixel-vanilla
+```
+
+| Flag | What it does | If omitted |
+|------|--------------|------------|
+| `CC=clang` | Plain Clang, **no** instrumentation. | Required for
+ `afl-fuzz -Q` (QEMU user-mode); any compiler-side instrumentation 
+ would conflict with QEMU's block translation. |
+
+| `-g` | DWARF debug info for QEMU-side triage. |
+ Crashes become hard to symbolize. |
+
+| `-O1` | Same optimisation level as Build 1. | Different `-O` makes
+ coverage comparison between the two campaigns meaningless. |
+
+| `--disable-shared` / `--disable-python` | Same as Build 1. | Same reasons. |
+
+### Patches applied to libsixel
+
+None.The Dockerfile clones the official upstream, checks out tag 
+`v1.8.6`, and builds with an unmodified `./configure && make`, 
+no `patch`, `sed -i`, `git apply`, nor any `COPY *.patch`.
+
+Effect on path discovery: no checksum or validation has been removed,
+so the fuzzer must legitimately defeat every format check in the SIXEL parser.
+Every crash is therefore a real bug against upstream, not an artefact
+of harness-side weakening.
+
+
+
 ## Q3 Seed Corpus and Dictionary
 
 
