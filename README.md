@@ -1,6 +1,9 @@
 # sofsec-lab2
 Lab 2 SoftSec
 
+LINK TO RAPORT:
+https://www.overleaf.com/3364939794vqfqwmpyqcjr#1dd22a
+
 ## Q1 — Harness Design
 
 ### Entry point choice: `sixel_decode_raw()`
