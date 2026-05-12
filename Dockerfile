@@ -37,6 +37,6 @@ RUN cd libsixel && \
 
 # Generate seed corpus and create artifact directories
 RUN python3 /lab/seeds/gen_seeds.py && \
-    mkdir -p /lab/findings /lab/findings-qemu
+    mkdir -p /lab/findings
 
 ENTRYPOINT ["/bin/bash"]
