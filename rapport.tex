@@ -1,13 +1,16 @@
 \documentclass[letterpaper,twocolumn,10pt]{article}
-\usepackage{usenix_2019_v3}
 
 \usepackage{tikz}
 \usepackage{amsmath}
 \usepackage{graphicx}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{booktabs}
 \usepackage{hyperref}
+\usepackage{subcaption}
 \usepackage{filecontents}
+\usepackage{float}
+\usepackage{placeins}
 
 \lstset{
   basicstyle=\ttfamily\footnotesize,
@@ -24,7 +27,7 @@
 %-------------------------------------------------------------------------------
 @misc{libsixel,
   author = {Hayaki Saito},
-  title  = {libsixel — {SIXEL} encoder/decoder library},
+  title  = {libsixel --- {SIXEL} encoder/decoder library},
   year   = 2014,
   note   = {\url{https://github.com/saitoha/libsixel}}
 }
@@ -35,21 +38,16 @@
   note   = {\url{https://github.com/AFLplusplus/AFLplusplus}}
 }
 @misc{cve220,
-  title  = {libsixel {GH} issue \#220 — heap-buffer-overflow in image\_buffer\_resize},
+  title  = {libsixel {GH} issue \#220 --- heap-buffer-overflow in image\_buffer\_resize},
   year   = 2021,
   note   = {\url{https://github.com/saitoha/libsixel/issues/220}}
 }
 \end{filecontents}
 
-%-------------------------------------------------------------------------------
 \begin{document}
-%-------------------------------------------------------------------------------
-
 \date{}
-
 \title{\Large \bf CS-412 Software Security Lab 2:\\
   Fuzzing \texttt{libsixel} with AFL++}
-
 \author{
 {\rm Denis Fedosov}\\
 EPFL
@@ -60,573 +58,441 @@ EPFL
 {\rm Antony Picard}\\
 EPFL
 \and
-{\rm Name Surname}\\
+{\rm Kurz Tizian}\\
 EPFL
 }
-
 \maketitle
 
 %-------------------------------------------------------------------------------
 \begin{abstract}
-%-------------------------------------------------------------------------------
 We present a coverage-guided fuzzing campaign against \texttt{libsixel}~\cite{libsixel},
-an open-source C library that encodes and decodes SIXEL bitmap graphics for terminal
-image display.
-Using AFL++~\cite{aflpp} with AddressSanitizer instrumentation, we fuzz the
-\texttt{sixel\_decode\_raw} decoder entry point and compare results with a QEMU-mode
-black-box campaign on an uninstrumented binary.
-% TODO: summarize key findings (crashes, CVEs, metrics) once campaign is complete.
+a C library that encodes and decodes SIXEL bitmap graphics. Using AFL++~\cite{aflpp}
+with AddressSanitizer, we fuzz multiple functions and compare results with a
+QEMU-mode black-box run on an uninstrumented binary. Our image-loading harness
+discovers a \texttt{bad-free} in \texttt{load\_png} reducible to an 8-byte PoC,
+matching upstream issue~\#220.
 \end{abstract}
 
 %-------------------------------------------------------------------------------
-\section{Q1 — Harness Design}
-\label{sec:q1}
+\section{Q1 --- Harness Design}
 %-------------------------------------------------------------------------------
 
-\subsection{Entry Points and Motivation}
-
-We explored the public API by grepping \texttt{SIXELAPI}-tagged symbols in the installed
-header and filtering for functions whose signatures accept raw buffers, file paths, or
-length parameters — the indicators that a function processes externally-controlled data.
-Functions taking only integer flags or opaque internal structs were excluded.
-
-We selected three entry points covering the two main subsystems of the library.
-\texttt{sixel\_decode\_raw()} is the lowest-level decoder: every higher-level path
-(\texttt{sixel\_decode}, \texttt{sixel\_decoder\_decode}, \texttt{sixel2png}) bottoms
-out here, making it the single point through which all attacker-controlled bytes flow.
-\texttt{sixel\_decode()} was kept as a second decoder target because it exercises the
-callback-setup layer that \texttt{sixel\_decode\_raw} skips.
-\texttt{sixel\_encoder\_encode()} was chosen for the image-loading path: it dispatches
-to libpng, libjpeg, and the BMP loader, exposing far more branching than any pure
-decoder harness — and it was the only entry point that produced crashes.
-Remaining candidates (\texttt{sixel\_encode}, \texttt{sixel\_dither\_initialize},
-\texttt{sixel\_helper\_scale\_image}) were rejected as narrow arithmetic entry points
-whose corpora saturate below 250 entries; \texttt{sixel\_decoder\_decode} was rejected
-for adding I/O-indirection objects over the same core parser.
+\subsection{Entry Points}
+We grepped \texttt{SIXELAPI}-tagged symbols in the installed header and kept only
+functions whose signatures accept raw buffers, file paths, or length parameters
+--- the indicators of externally-controlled data. We selected three entry points.
+\texttt{sixel\_decode\_raw()} is the lowest-level decoder: every higher-level
+path (\texttt{sixel\_decode}, \texttt{sixel\_decoder\_decode}, \texttt{sixel2png})
+bottoms out here, making it the single point through which all attacker bytes
+flow. \texttt{sixel\_decode()} was kept as a second decoder target since it
+exercises the callback-setup layer that \texttt{sixel\_decode\_raw} skips.
+\texttt{sixel\_encoder\_encode()} was chosen for the image-loading path: it
+dispatches to libpng, libjpeg, and the BMP loader, exposing far more branching
+than any pure decoder --- and it was the only entry point that produced crashes.
+Rejected candidates: \texttt{sixel\_encode}, \texttt{sixel\_dither\_initialize},
+\texttt{sixel\_helper\_scale\_image} (narrow arithmetic entry points, corpora
+saturate below 250 entries), and \texttt{sixel\_decoder\_decode} (I/O-indirection
+over the same core parser).
 
 \subsection{Data Flow and Guards}
+All harnesses share one skeleton: open the AFL++ input from \texttt{argv[1]},
+read it into a heap buffer, validate, call the API, free all allocations.
+\textbf{Sixel-stream harnesses} (\texttt{harness\_decode\_raw},
+\texttt{harness\_decode}) pass the raw bytes directly to the library; output
+buffers allocated by libsixel (\texttt{pixels}, \texttt{palette}) are freed per
+iteration to stay compatible with persistent mode. \textbf{File-path harness}
+(\texttt{harness\_load\_image}) passes \texttt{argv[1]} to
+\texttt{sixel\_encoder\_encode}, which opens the file internally and dispatches
+to the appropriate loader; stdout is redirected to \texttt{/dev/null} so SIXEL
+escape sequences do not pollute timing.
 
-All harnesses share the same skeleton: open the AFL++ input file supplied as
-\texttt{argv[1]}, read it into a heap buffer, validate it, call the library function,
-then free all allocations.
-The two harness families differ in what ``validate'' and ``call'' mean.
-
-\textbf{Family 1 — Sixel-stream harnesses (\texttt{harness\_decode\_raw},
-\texttt{harness\_decode}).}
-AFL++ supplies a file path via \texttt{argv[1]}; the harness opens the file, reads its
-entire content into a heap buffer, and passes the raw bytes directly to the library
-API call.
-Output buffers (\texttt{pixels}, \texttt{palette}) allocated by the library are freed
-after each iteration to keep the harness compatible with persistent mode.
-
-\textbf{Family 2 — File-path harness (\texttt{harness\_load\_image}).}
-\texttt{sixel\_encoder\_encode} takes a file path, opens it internally, and dispatches
-to libpng, libjpeg, or the BMP loader.
-The harness passes \texttt{argv[1]} directly; AFL++ writes the test image file to that
-path.
-Stdout is redirected to \texttt{/dev/null} to prevent SIXEL escape sequences from
-reaching the terminal and corrupting timing measurements.
-
-\bigskip
 \textbf{Guard explanations.}
-
-\textbf{(a) \texttt{if (argc < 2) return 1}.}
-AFL++ always supplies the input path as \texttt{argv[1]} via \texttt{@@}.
-Without this guard a manual invocation during development would crash the harness
-itself, not the library, producing a misleading crash report.
-
-\textbf{(b) \texttt{if (!f) return 1}.}
-Prevents a NULL dereference in the subsequent \texttt{fseek} call if the file cannot
-be opened (e.g.\ on AFL++'s initialisation probe).
-
-\textbf{(c) \texttt{if (size == 0 || size > 1000000)}.}
-An empty file would pass a zero-length buffer to the parser, producing no useful
-coverage signal and wasting an iteration.
-The upper bound (1\,MB) prevents the fuzzer from constructing a raster-attribute header
-such as \texttt{"100000;100000q"} that causes the library to attempt a multi-gigabyte
-pixel-buffer allocation — which produces a timeout or OOM rather than a
-crash signal, starving the fuzzer of feedback.
-
-\textbf{(d) \texttt{if (!data) return 1}.}
-A \texttt{malloc} failure under ASan's shadow-memory pressure would produce a harness
-crash unrelated to the library; we exit cleanly so AFL++ does not save it as a
-false-positive crash.
-
-\textbf{(e) \texttt{free(data); free(pixels)}.}
-\texttt{sixel\_decode\_raw} allocates the output pixel and palette buffers and transfers
-ownership to the caller.
-In fork mode, failing to free leaks memory per process but the OS reclaims it on exit;
-we still free to keep the harness suitable for persistent mode, where the same process
-runs thousands of iterations and an accumulated leak would cause OOM termination.
+\textbf{(a)}~\texttt{if (argc < 2) return 1} --- protects against manual
+invocation during development, which would otherwise crash the harness itself
+and produce misleading reports. \textbf{(b)}~\texttt{if (!f) return 1} ---
+prevents NULL dereference in the subsequent \texttt{fseek} when AFL++'s
+initialisation probe fails to open a file.
+\textbf{(c)}~\texttt{if (size == 0 || size > 1000000)} --- an empty file gives
+no coverage signal; the 1\,MB cap prevents raster-attribute headers like
+\texttt{"100000;100000q"} from triggering multi-gigabyte allocations that turn
+into timeouts/OOM rather than crash signals. \textbf{(d)}~\texttt{if (!data)
+return 1} --- a \texttt{malloc} failure under ASan's shadow pressure would be
+saved as a false-positive crash; we exit cleanly. \textbf{(e)}~\texttt{free(data);
+free(pixels)} --- \texttt{sixel\_decode\_raw} transfers ownership of output
+buffers to the caller; fork mode would leak per-process but the OS reclaims on
+exit, whereas persistent mode running thousands of iterations would OOM.
 
 %-------------------------------------------------------------------------------
-\section{Q2 — Instrumentation and Sanitizers}
-\label{sec:q2}
+\section{Q2 --- Instrumentation and Sanitizers}
 %-------------------------------------------------------------------------------
 
-\subsection{Build 1 — Instrumented (White-Box, AFL++ + ASan)}
+The full build-flag table is in Appendix~\ref{app:builds}
+(Table~\ref{tab:builds}). In summary: \textbf{Build~1 (white-box)} uses
+\texttt{afl-clang-lto} for collision-free edge IDs plus
+\texttt{-fsanitize=address} to catch silent heap corruption, compiled static
+(\texttt{--disable-shared}) so AFL's shm map reaches inside the library.
+\textbf{Build~2 (black-box)} is plain Clang with \texttt{-g -O1} and no
+sanitizer/AFL pass so it can run under \texttt{afl-fuzz -Q}. Both use
+\texttt{--disable-python} to work around a \texttt{make install} failure on
+Python~3.12+ (removed \texttt{imp} module).
 
-\begin{center}
-\begin{tabular}{p{2.4cm}p{4.8cm}}
-\hline
-\textbf{Flag} & \textbf{Effect / if omitted} \\
-\hline
-\texttt{CC=afl-clang-lto} & AFL++ LTO instrumentation: collision-free edge IDs in every basic block. Without it, no coverage feedback; AFL degenerates to blind random fuzzing. \\
-\texttt{-fsanitize=address} (CFLAGS) & ASan red-zones, shadow memory, quarantine on free. Without it, heap OOB/UAF silently corrupts memory and AFL never saves them under \texttt{crashes/}. \\
-\texttt{-fsanitize=address} (LDFLAGS) & Links the ASan runtime. Without it, undefined references at link time or runtime not active. \\
-\texttt{-g} & DWARF debug info. Without it, ASan traces show raw addresses only. \\
-\texttt{-O1} & Light optimisation. \texttt{-O0} bloats edge map; \texttt{-O2/-O3} inlines aggressively, hiding branches. \\
-\texttt{--disable-shared} & Static \texttt{libsixel.a}. A \texttt{.so} loaded dynamically bypasses AFL's shm map giving 0\% coverage inside the library. \\
-\texttt{--disable-python} & Skips Python binding installation. Without it, \texttt{make install} crashes on Python\,3.12+ because the \texttt{imp} module was removed; the build fails before the library is installed. \\
-\hline
-\end{tabular}
-\end{center}
-
-\subsection{Build 2 — Vanilla (Black-Box, QEMU Mode)}
-
-\begin{center}
-\begin{tabular}{p{2.4cm}p{4.8cm}}
-\hline
-\textbf{Flag} & \textbf{Effect / if omitted} \\
-\hline
-\texttt{CC=clang} & Plain Clang, no instrumentation. Required for \texttt{afl-fuzz -Q}; compiler-side instrumentation conflicts with QEMU block translation. \\
-\texttt{-g} & DWARF debug info for triage. \\
-\texttt{-O1} & Same level as Build~1 so coverage comparisons are meaningful. \\
-\texttt{--disable-python} & Same reason as Build~1: prevents \texttt{make install} from failing on Python\,3.12+. \\
-\hline
-\end{tabular}
-\end{center}
-
-\subsection{Patches}
-
-None.
-The Dockerfile clones the official upstream, checks out tag \texttt{v1.8.6}, and builds
-with an unmodified \texttt{./configure \&\& make} — no \texttt{patch}, \texttt{sed~-i},
-or \texttt{git apply}.
-Every crash is therefore a real bug against upstream, not an artefact of harness-side
-weakening.
+\textbf{Patches: none.} The Dockerfile clones upstream, checks out tag
+\texttt{v1.8.6}, and builds with an unmodified \texttt{./configure \&\& make}
+--- no \texttt{patch}, \texttt{sed~-i}, or \texttt{git apply}. Every crash is
+therefore a real bug against upstream, not a harness-side artefact.
 
 %-------------------------------------------------------------------------------
-\section{Q3 — Seed Corpus and Dictionary}
-\label{sec:q3}
+\section{Q3 --- Seed Corpus and Dictionary}
 %-------------------------------------------------------------------------------
 
-\subsection{Seeds}
+\textbf{Seeds.} Two hand-crafted SIXEL files (162\,B total) generated by
+\texttt{seeds/gen\_seeds.py}. \texttt{epfl.six} (134\,B) renders the EPFL logo
+using two palette entries and exercises every major control code: run-length
+(\texttt{!N}), carriage-return (\texttt{\$}), newline (\texttt{-}).
+\texttt{minimal.six} (28\,B) is the smallest syntactically valid stream
+(\texttt{ESC Pq}\,\ldots\,\texttt{ESC\,\textbackslash}), used for harness
+sanity-checking.
 
-Our seed corpus contains two hand-crafted SIXEL files (generated by
-\texttt{seeds/gen\_seeds.py}) totalling 162 bytes:
+\textbf{Dictionary.} Nine tokens in \texttt{sixel.dict}
+(Appendix~\ref{app:dict}, Listing~\ref{lst:dict}). Formally these are the
+\emph{terminal symbols} of the SIXEL context-free grammar: the start symbol is
+a DCS string and the body is a sequence of colour, raster-attribute and
+sixel-band productions delimited by one-byte terminals. Discovering the DCS
+introducer \texttt{ESC Pq} by random mutation has probability $\approx 2^{-16}$
+per byte pair; the dictionary hands AFL++ these terminals directly so
+\emph{havoc} can splice valid token boundaries from cycle~1.
 
-\begin{description}
-  \item[\texttt{epfl.six} (134\,B)] Renders the EPFL logo using two palette entries,
-    run-length encoding (\texttt{!N}), carriage-return (\texttt{\$}), and
-    newline (\texttt{-}) — exercises every major SIXEL control code.
-  \item[\texttt{minimal.six} (28\,B)] A single-color $1\times6$ image: the smallest
-    syntactically valid SIXEL stream (\texttt{ESC Pq} … \texttt{ESC \textbackslash}),
-    used to verify harness correctness and give the fuzzer a minimal starting point.
-\end{description}
-
-\subsection{Dictionary}
-
-The project-local dictionary \texttt{sixel.dict} contains the following token entries:
-
-\begin{lstlisting}
-header_pq="\x1bPq"      # DCS introducer + 'q' (most common form)
-header_p="\x1bP"        # DCS introducer without mode byte
-terminator="\x1b\\"     # String Terminator (ST)
-color_intro="#"          # palette entry / color selector
-raster_attr="\""         # raster-attributes introducer
-rle_intro="!"            # run-length encoding introducer
-graphics_cr="$"          # graphics carriage return
-graphics_nl="-"          # graphics newline (advance one sixel band)
-param_sep=";"            # parameter separator
-\end{lstlisting}
-
-In formal terms, these entries are the \emph{terminal symbols} of the SIXEL
-context-free grammar.  The grammar's start symbol is a DCS string
-(\texttt{ESC P} \ldots{} \texttt{ESC \textbackslash}); the body is a sequence of
-color-introduction productions, raster-attribute productions, and sixel-band
-productions, each delimited by the single-character terminals above.
-Without the dictionary, discovering the two-byte DCS introducer \texttt{ESC Pq}
-by random mutation has probability $\approx 2^{-16}$ per byte pair; the dictionary
-hands AFL++ these terminals directly, letting \emph{havoc} splice valid token
-boundaries into otherwise-garbage inputs from the first cycle.
-
-\subsection{Coverage Contribution}
-
-From the AFL++ status screen after the 40-minute \texttt{harness\_decode\_raw} campaign
-(\texttt{corpus\_count: 859}, \texttt{corpus\_found: 856}, \texttt{edges\_found: 469}
-of 1\,065 total; \texttt{bitmap\_cvg: 44.04\%}):
-
-\begin{itemize}
-  \item \textbf{Havoc} produced \textbf{839} of the 856 new corpus entries,
-    of which \textbf{87} triggered genuinely new edge coverage (\texttt{+cov}).
-    This stage dominates because the dictionary tokens give havoc material to
-    splice into structurally plausible positions, rapidly reaching palette and
-    run-length code paths.
-  \item \textbf{Deterministic} passes (\texttt{op:(null)}) produced \textbf{16}
-    entries, \textbf{8} with new coverage — useful early on for simple byte-flip
-    and arithmetic discoveries but quickly exhausted on the two small seeds.
-  \item \textbf{Splice} contributed \textbf{0} entries.  Splice requires at least
-    two corpus entries to combine; with only two seeds available at startup, and the
-    queue growing only through havoc, splice never fired during this campaign.
-\end{itemize}
+\textbf{Coverage contribution} (from the 40\,min \texttt{harness\_decode\_raw}
+status screen: \texttt{corpus\_count=859}, \texttt{corpus\_found=856},
+\texttt{edges\_found=469/1\,065}, \texttt{bitmap\_cvg=44.04\%}):
+\emph{Havoc} produced 839/856 new entries (87 with new edges) --- it dominates
+because dictionary tokens give havoc material to splice into plausible
+positions. \emph{Deterministic} passes produced 16 entries (8 with new
+coverage), quickly exhausted on two small seeds. \emph{Splice} contributed 0:
+it requires $\geq 2$ corpus entries to combine, and with only two seeds at
+startup it never fired.
 
 %-------------------------------------------------------------------------------
-\section{Q4 — Campaign Analysis}
-\label{sec:q4}
+\section{Q4 --- Campaign Analysis}
 %-------------------------------------------------------------------------------
 
-We focus on the two campaigns most relevant to Q4: the image-loading campaign that
-produced crashes (\texttt{harness\_load\_image}) and the QEMU black-box campaign
-(\texttt{harness\_vanilla}).  Both ran for 40 minutes (2\,400\,s) on a single core.
+We focus on the image-loading campaign that found crashes
+(\texttt{harness\_load\_image}) and the QEMU black-box campaign
+(\texttt{harness\_vanilla}); both ran 40\,min on a single core. Status screens
+and edge plots: Appendix~\ref{app:plots}.
 
-\subsection{\texttt{harness\_load\_image} — Instrumented, Crashes Found}
+\textbf{\texttt{harness\_load\_image} (crashes found).} Stability 100\% (fully
+deterministic); corpus 1\,318 inputs (1\,314 found by mutation), the largest
+campaign since PNG/JPEG/BMP parsing exposes far more branches than the pure
+decoder; map density 12.66\% (2\,114/16\,697), the large denominator including
+libpng, libjpeg and BMP code with paths requiring magic bytes the fuzzer had
+not yet synthesised; cycles done 0 (859 pending, 44 pending-favoured ---
+corpus still actively growing); 2 saved crashes, 8 hangs.
+\emph{Edges curve:} immediate sustained discovery --- 977 edges at $t=60$\,s,
+1\,065 at $t=156$\,s, 1\,221 at $t=376$\,s, 1\,384 at $t=580$\,s, 2\,114 at
+$t=2\,400$\,s, no plateau. Crashes appeared in the very first recorded
+interval (bug triggered within the first minute). \textbf{Did not saturate}:
+edge count still rising, 0 cycles completed, pending-favoured entries remained.
 
-Key metrics from the AFL++ status screen (Figure~\ref{fig:afl-status}):
-
-\begin{description}
-  \item[Stability] \textbf{100\%} — the image-loading chain is fully deterministic.
-  \item[Corpus count] \textbf{1\,318} inputs (1\,314 found by mutation), the largest
-    of all campaigns; the PNG/JPEG/BMP parsing chains expose far more branches than
-    the pure decoder.
-  \item[Map density] \textbf{12.66\%} — 2\,114 edges out of 16\,697 instrumented.
-    The large denominator includes libpng, libjpeg, and BMP code; many paths require
-    specific magic bytes the fuzzer had not yet synthesised within 40 minutes.
-  \item[Cycles done] \textbf{0} — the fuzzer never completed a full queue pass
-    (859 entries still pending, 44 pending-favoured), confirming the corpus was
-    still actively growing at campaign end.
-  \item[Saved crashes / hangs] \textbf{2 crashes, 8 hangs}.
-\end{description}
-
-\textbf{Edges curve} (Figure~\ref{fig:edges}).
-Edge discovery was immediate and sustained: 977 edges at $t = 60$\,s, rising to
-1\,065 by $t = 156$\,s ($\approx$2.5\,min), then continuing steadily to 1\,221 at
-$t = 376$\,s, 1\,384 at $t = 580$\,s, and 2\,114 at $t = 2\,400$\,s with no
-plateau.  Crashes appeared at the very first recorded interval ($t = 60$\,s, 2 saved
-crashes), meaning the bug was triggered within the first minute.
-
-\textbf{Saturation.}
-This campaign did \emph{not} saturate: edge count was still rising at campaign end,
-0 cycles completed, and 44 pending-favoured entries remained.
-Longer runtime would continue to uncover new paths.
-
-\subsection{QEMU Mode — \texttt{harness\_vanilla}}
-
-Key metrics (Figure~\ref{fig:afl-status-qemu}):
-
-\begin{description}
-  \item[Stability] \textbf{100\%}.
-  \item[Corpus count] \textbf{700} inputs (697 found).
-  \item[Map density] \textbf{0.71\%} — 463 slots out of a fixed 65\,536-slot
-    hash map.  The low density is an artefact of the large fixed bitmap, not fewer
-    edges covered; the raw edge count (463) matches the instrumented decoder campaign
-    (469), confirming QEMU explored the same code.
-  \item[Cycles done] \textbf{3} — three full passes, only 21 entries still pending.
-  \item[Saved crashes] \textbf{0}.
-\end{description}
-
-\textbf{Edges curve} (Figure~\ref{fig:edges-qemu}).
-420 edges at $t = 60$\,s, reaching 463 by $t = 307$\,s ($\approx$5\,min), then
-flat for the remaining 35 minutes.
-
-\textbf{Saturation.}
-QEMU saturated by minute 5: three completed cycles, 21 pending entries, and a
-perfectly flat edge curve for the final 35 minutes.  Without ASan there is no
-memory-error signal, so the fuzzer cannot distinguish crashes from normal exits and
-stops finding new paths once the structural variation space is exhausted.
+\textbf{QEMU (\texttt{harness\_vanilla}).} Stability 100\%; corpus 700
+inputs (697 found); map density 0.71\% (463/65\,536) --- the low density is an
+artefact of QEMU's fixed 65\,536-slot bitmap, not fewer edges: the raw count
+463 matches the instrumented decoder's 469, confirming QEMU explored the same
+code; cycles done 3 (21 entries pending); 0 saved crashes.
+\emph{Edges curve:} 420 at $t=60$\,s, 463 by $t=307$\,s ($\approx 5$\,min),
+flat for the remaining 35\,min. \textbf{Saturated by minute 5}: three completed
+cycles, flat curve. Without ASan the fuzzer cannot distinguish silent memory
+corruption from normal exits, so it stops finding new paths once the
+structural variation space is exhausted.
 
 %-------------------------------------------------------------------------------
-\section{Q5 — Crash Triage}
-\label{sec:q5}
+\section{Q5 --- Crash Triage}
 %-------------------------------------------------------------------------------
 
-\subsection{Crash Found}
+The \texttt{harness\_load\_image} campaign produced \textbf{2 unique crashes}
+(\texttt{id:000000}, \texttt{id:000001}; signal~6/SIGABRT) plus 8 hangs; both
+reduce to the same bug (identical ASan trace). \texttt{harness\_decode\_raw}
+found none.
 
-The \texttt{harness\_load\_image} campaign produced \textbf{2 unique crash files}
-(\texttt{id:000000} and \texttt{id:000001}, signal 6 / SIGABRT) plus 8 hangs.
-Both crashes reduce to the same bug (identical ASan call stack).
-The \texttt{harness\_decode\_raw} campaign found no crashes.
+\textbf{Reproduce.} Running the harness on the crash yields an ASan
+\texttt{bad-free} (full trace in Appendix~\ref{app:crash},
+Listing~\ref{lst:asan}). Allocation in \texttt{sixel\_frame\_new}
+(\texttt{frame.c:61}); bogus free at \texttt{loader.c:633}.
 
-\subsection{Step 1 — Reproduce}
+\textbf{Minimize.} \texttt{afl-tmin} reduced the 60-byte crash to 8 bytes
+(86.67\%, 66 executions). The minimized PoC is exactly the PNG magic bytes
+(\texttt{89 50 4e 47 0d 0a 1a 0a}) with no IHDR --- the shortest input that
+makes libpng fail and trigger the \texttt{longjmp} path leading to the bad free.
 
-\begin{lstlisting}[language=bash]
-$ ./harness_load_image \
-    findings/load-image/default/crashes/\
-    id:000000,sig:06,...,op:havoc,rep:2
-\end{lstlisting}
+\textbf{Root cause.} \texttt{load\_png()} declares \texttt{unsigned char **rows}
+at line 315 \emph{without} \texttt{volatile} and initialises it to \texttt{NULL}
+at line 332 --- \emph{after} the first \texttt{setjmp} (line 323). When libpng
+detects a malformed PNG (here: missing IHDR) its error callback executes
+\texttt{longjmp(png\_jmpbuf(png\_ptr), 1)}, jumping back to the second
+\texttt{setjmp} at line 345. Per C11~\S7.13.2.1, a non-\texttt{volatile} local
+written between \texttt{setjmp} and \texttt{longjmp} has \emph{indeterminate}
+value after the jump; the compiler may keep \texttt{rows} in a register that
+\texttt{longjmp} restores to a stale value. Execution falls through to the
+\texttt{cleanup} label, which calls \texttt{sixel\_allocator\_free(allocator,
+rows)} on that garbage pointer.
 
-\noindent ASan output (abridged):
-\begin{lstlisting}
-ERROR: AddressSanitizer: attempting free on
-  address which was not malloc()-ed:
-  0x507000000040 in thread T0
-  #0 free (harness_load_image)
-  #1 load_png  loader.c:633
-  #2 load_with_builtin  loader.c:889
-  #3 sixel_helper_load_image_file  loader.c:1418
-  #4 sixel_encoder_encode  encoder.c:1743
-  #5 main  harness_load_image.c:16
-Alloc: malloc <- sixel_frame_new  frame.c:61
-       <- load_with_builtin  loader.c:885
-SUMMARY: bad-free in free
-\end{lstlisting}
-
-\subsection{Step 2 — Minimize with \texttt{afl-tmin}}
-
-\begin{lstlisting}[language=bash]
-$ afl-tmin \
-    -i findings/load-image/default/crashes/\
-       id:000000,sig:06,...,op:havoc,rep:2 \
-    -o minimized_crash.png \
-    -- ./harness_load_image @@
-# File size reduced by: 86.67% (60 -> 8 bytes)
-# 66 executions
-\end{lstlisting}
-
-The 8-byte minimized PoC is exactly the PNG magic bytes
-(\texttt{89 50 4e 47 0d 0a 1a 0a}) with no IHDR or data chunks —
-the shortest input that causes libpng to fail and trigger the
-\texttt{longjmp} path leading to the bad free.
-
-\subsection{Step 3 — Root Cause}
-
-\textbf{Bug location:} \texttt{libsixel/src/loader.c:633} in \texttt{load\_png()}.
-
-\textbf{Mechanism.}
-\texttt{load\_png()} declares \texttt{unsigned char **rows} at line 315
-\emph{without} the \texttt{volatile} qualifier and initialises it to \texttt{NULL}
-at line 332 — \emph{after} the first \texttt{setjmp} call (line 323).
-When libpng detects a malformed PNG (here: missing IHDR) it calls its
-error callback, which executes \texttt{longjmp(png\_jmpbuf(png\_ptr), 1)}
-— jumping back to the second \texttt{setjmp} at line 345.
-Per C11~\S7.13.2.1, a non-\texttt{volatile} local whose value was changed between
-the \texttt{setjmp} and the \texttt{longjmp} has \emph{indeterminate} value after
-the jump; because \texttt{rows} was written \emph{after} the first \texttt{setjmp},
-the compiler may keep it in a register that \texttt{longjmp} restores to a stale
-value.
-Execution falls through to the \texttt{cleanup} label, which calls
-\texttt{sixel\_allocator\_free(allocator, rows)} (line 633) on that garbage pointer,
-producing the \texttt{bad-free}.
-
-\textbf{Bug classification.}
-\begin{description}
-  \item[ASan label] \texttt{bad-free} (free of non-malloc pointer)
-  \item[CWE] CWE-825 — Expired Pointer Dereference (indeterminate pointer after
-    \texttt{longjmp}); secondary CWE-755 (improper handling of exceptional conditions).
-  \item[CVE] Matches the root cause of libsixel GitHub issue \#220~\cite{cve220}
-    (\texttt{heap-buffer-overflow} in related PNG cleanup path, v1.8.6).
-\end{description}
+\textbf{Classification.} ASan \texttt{bad-free}; CWE-825 (Expired Pointer
+Dereference --- indeterminate pointer after \texttt{longjmp}) with secondary
+CWE-755; matches the root cause of libsixel issue~\#220~\cite{cve220}
+(\texttt{heap-buffer-overflow} in the related PNG cleanup path, v1.8.6).
 
 %-------------------------------------------------------------------------------
-\section{Q6 — Attack Surface Analysis}
-\label{sec:q6}
+\section{Q6 --- Attack Surface Analysis}
 %-------------------------------------------------------------------------------
 
-\subsection{Real-World Applications}
+\textbf{Real-world applications.} \emph{\texttt{img2sixel}} (shipped with
+libsixel) converts PNG/JPEG/BMP images to SIXEL for terminal display: any user
+passing an untrusted image triggers the full image-loading and decoding
+pipeline in their security context. \emph{FFmpeg-SIXEL} streams multimedia
+(e.g.\ YouTube) directly to the terminal; because FFmpeg fetches and decodes
+remote media, an attacker controlling a media stream can deliver a crafted PNG
+that triggers the \texttt{bad-free} with no local file access required.
 
-\textbf{Application 1: \texttt{img2sixel}.}
-A command-line utility provided directly by the libsixel project.
-It converts image formats such as PNG, JPEG, and BMP into SIXEL format so they can be
-displayed inside a terminal emulator.
-Any user who pipes or passes an untrusted image file to \texttt{img2sixel} triggers the
-full image-loading and decoding pipeline in the process's security context.
+\textbf{Attack scenario.} The \texttt{bad-free} can lead to arbitrary code
+execution in an unsecured remote environment. An attacker crafts an image
+forcing \texttt{libsixel} to allocate memory in a predictable pattern; when
+the bad free fires, allocator metadata can be corrupted to write
+attacker-controlled data into an arbitrary location such as a GOT entry. The
+next indirect call redirects execution to shellcode. No authentication or
+interaction beyond image delivery is required.
 
-\textbf{Application 2: FFmpeg-SIXEL.}
-A collection of libraries and tools to process multimedia content (audio, video,
-subtitles).
-It enables, for instance, YouTube streaming rendered directly in the terminal.
-Because FFmpeg fetches and decodes remote media, an attacker controlling a media stream
-or file can deliver a crafted PNG that triggers the \texttt{bad-free} in
-\texttt{load\_png} with no local file access required.
-
-\subsection{Concrete Attack Scenario}
-
-In an unsecured remote environment the \texttt{bad-free} vulnerability can lead to
-arbitrary code execution.
-An attacker crafts an image that forces \texttt{libsixel} to allocate memory in a
-predictable pattern.
-When the \texttt{bad-free} is triggered, the allocator metadata can be corrupted to
-write attacker-controlled data into an arbitrary location — for instance, a function
-pointer in a loaded library's GOT entry.
-When the library subsequently calls through that pointer, execution is redirected to
-attacker-supplied shellcode.
-The attack requires no authentication and no interaction beyond delivering the
-malicious image to a vulnerable application.
-
-\subsection{Code Paths Not Exercised by the Harness}
-
-\textbf{Gap 1: \texttt{sixel\_encode()} — raw encoder path.}
-Our harnesses cover the decoder and the high-level image-loading encoder, but not the
-raw pixel-buffer encoder (\texttt{src/tosixel.c}).
-It processes dimensions and colour-reduction parameters that are partially
-controlled by image metadata; integer overflow in dimension arithmetic could produce
-an undersized output buffer.
-
-\textbf{Gap 2: \texttt{sixel\_helper\_normalize\_pixelformat()} — pixel-format conversion.}
-This function (\texttt{src/pixelformat.c}) performs arithmetic on width, height, and
-bytes-per-pixel values derived from a decoded image.
-Integer overflow in these calculations could produce an undersized destination buffer,
-leading to an out-of-bounds write that our harness never reaches because we do not call
-the pixel-format normaliser after decoding.
+\textbf{Gaps in coverage.} \emph{Gap~1:} \texttt{sixel\_encode()}
+(\texttt{src/tosixel.c}) --- the raw encoder processes dimensions and
+colour-reduction parameters partially controlled by image metadata; integer
+overflow in dimension arithmetic could produce an undersized output buffer.
+\emph{Gap~2:} \texttt{sixel\_helper\_normalize\_pixelformat()}
+(\texttt{src/pixelformat.c}) performs arithmetic on width, height and
+bytes-per-pixel derived from a decoded image. Integer overflow here could
+produce an undersized destination, leading to an OOB write our harness never
+reaches since we do not call the normaliser after decoding.
 
 %-------------------------------------------------------------------------------
-\section{Q7 — Binary-Only Fuzzing with QEMU Mode}
-\label{sec:q7}
+\section{Q7 --- Binary-Only Fuzzing with QEMU Mode}
 %-------------------------------------------------------------------------------
 
-The vanilla binary was built with plain Clang (no AFL++ instrumentation, no ASan)
-against a separately compiled \texttt{libsixel-vanilla} and launched under QEMU mode:
+The vanilla binary was built with plain Clang (no instrumentation, no ASan)
+against a separately compiled \texttt{libsixel-vanilla} and launched under
+QEMU. Both campaigns targeted \texttt{sixel\_decode\_raw} for 40\,min.
+Side-by-side comparison in Appendix~\ref{app:tables} (Table~\ref{tab:qemu}).
 
-\subsection{Comparison: Instrumented vs.\ QEMU}
+\textbf{Exec speed.} QEMU 409\,exec/s vs.\ instrumented 355\,exec/s
+(15\% QEMU advantage). Counterintuitive, but explained by workload: QEMU's JIT
+adds first-encounter translation cost, but translated blocks are cached for
+every subsequent iteration of the short \texttt{sixel\_decode\_raw} function.
+ASan, by contrast, inserts a shadow-memory check before \emph{every} load/store
+and runs heap quarantine on every alloc/free, dominating per-exec cost.
+Without ASan, compile-time instrumentation would be faster than QEMU; ASan
+inverts the ordering.
 
-Both campaigns targeted \texttt{sixel\_decode\_raw} and ran for 40 minutes (2\,400\,s).
-The instrumented baseline is \texttt{harness\_decode\_raw} (findings from
-\texttt{findings/decode-raw}).
+\textbf{Edges.} 469 (instrumented) vs.\ 463 (QEMU) --- nearly identical. The
+gap reflects probabilistic hash collisions in QEMU's fixed 65\,536-slot
+bitmap: two distinct edges hashing to the same slot are counted once. The
+instrumented build assigns a unique compile-time ID to every CFG edge.
+Map-density figures (44\% vs.\ 0.71\%) are not comparable: the instrumented
+denominator is the real edge count (1\,065) while QEMU's is its fixed map size.
 
-\begin{center}
-\begin{tabular}{lcc}
-\hline
-\textbf{Metric} & \textbf{Instrumented} & \textbf{QEMU} \\
-\hline
-Duration             & 40 min & 40 min \\
-Avg exec speed (exec/s) & 355 & 409 \\
-Edges discovered     & 469 & 463 \\
-Total edge map size  & 1\,065 & 65\,536 \\
-Map density          & 44.04\% & 0.71\% \\
-Corpus count         & 859 & 700 \\
-Cycles done          & 2 & 3 \\
-Saved crashes        & 0 & 0 \\
-\hline
-\end{tabular}
-\end{center}
-
-\textbf{Exec speed.}
-QEMU mode ran at 409\,exec/s versus 355\,exec/s for the ASan-instrumented build —
-a 15\% advantage.
-This is counterintuitive: QEMU's JIT block translation adds overhead on first
-execution, but for a short-running function like \texttt{sixel\_decode\_raw} the
-translated blocks are cached and reused for every subsequent iteration.
-The ASan runtime, by contrast, inserts a shadow-memory check before \emph{every}
-load and store and runs heap quarantine logic on every allocation and free,
-dominating per-execution cost.
-Without ASan, compile-time instrumentation would be faster than QEMU; ASan inverts
-the ordering here.
-
-\textbf{Edges discovered.}
-Both campaigns found almost identical code: 469 (instrumented) vs.\ 463 (QEMU).
-The small gap reflects probabilistic hash collisions in QEMU's fixed 65\,536-slot
-bitmap — two distinct edges that hash to the same slot are treated as one, slightly
-undercounting unique paths.
-The instrumented build assigns a unique ID to every CFG edge at compile time,
-so all 469 are truly distinct.
-The map-density figures (44\% vs.\ 0.71\%) are not comparable: the instrumented
-build's denominator is the real number of edges in the binary (1\,065), while
-QEMU's fixed 65\,536-slot map makes density a function of map size, not coverage.
-
-\textbf{Corpus count.}
-The instrumented campaign built a larger corpus (859 vs.\ 700) in the same time.
-Collision-free edge IDs give AFL++ a more precise novelty signal: two inputs that
-differ only in which of two colliding edges they hit are treated as distinct by
-the instrumented build but identical by QEMU, so the instrumented fuzzer saves
-more queue entries and explores a broader set of mutations.
+\textbf{Corpus.} 859 (instrumented) vs.\ 700 (QEMU). Collision-free edge IDs
+give a more precise novelty signal: two inputs differing only in which of two
+colliding edges they hit are distinct in the instrumented build but identical
+to QEMU, so the instrumented fuzzer saves more queue entries and explores
+broader mutations.
 
 %-------------------------------------------------------------------------------
-\section{Q8 — Instrumentation Depth and Performance}
-\label{sec:q8}
+\section{Q8 --- Instrumentation Depth and Performance}
 %-------------------------------------------------------------------------------
 
-\subsection{Instrumented Edge Counts}
+\textbf{Edge counts} (from \texttt{total\_edges} at startup):
+\texttt{harness\_decode\_raw} \textbf{1\,065 edges} --- only what is reachable
+from \texttt{sixel\_decode\_raw} after linker dead-code elimination (encoder,
+scaler, pixel-format routines stripped). \texttt{harness\_decode}
+\textbf{1\,057} --- nearly identical, confirming both exercise the same decoder
+call graph. \texttt{harness\_load\_image} \textbf{16\,697} --- much larger
+because \texttt{sixel\_encoder\_encode} pulls in libpng, libjpeg, the
+colour-reduction path and I/O wrappers. The 1\,065 vs.\ 16\,697 gap shows how
+entry-point selection determines instrumentation scope: the same library
+produces very different coverage maps depending on which subsystem the harness
+calls.
 
-\begin{description}
-  \item[\texttt{harness\_decode\_raw}] \textbf{1\,065} edges reported by AFL++ at
-    startup (from \texttt{total\_edges} in \texttt{fuzzer\_stats}).
-    This counts only edges reachable from \texttt{sixel\_decode\_raw} via the linker's
-    dead-code elimination; the encoder, scaler, and pixel-format routines are stripped.
-  \item[\texttt{harness\_decode}] \textbf{1\,057} edges — nearly identical, confirming
-    both harnesses exercise the same decoder call graph.
-  \item[\texttt{harness\_load\_image}] \textbf{16\,697} edges — significantly larger
-    because \texttt{sixel\_encoder\_encode} pulls in the PNG/JPEG decoder chain
-    (libpng, libjpeg), the colour-reduction path, and I/O wrappers.
-\end{description}
+\textbf{Map density vs.\ total edges.} Density is
+$d = e_{\text{reached}}/e_{\text{total}}$. Not all instrumented edges are
+reachable from \texttt{sixel\_decode\_raw}: encoder paths, pixel-format
+converters and write-side I/O are compiled in (with \texttt{--whole-archive})
+but never called. Even among reachable edges, paths gated on rare valid
+sequences (e.g.\ a valid HLS triple followed by a specific run-length token)
+may need many mutations to discover within 40\,min. The QEMU density (0.72\%)
+is a fixed-map artefact, not a measure of real library coverage.
 
-The difference between the decode harness (1\,065 edges) and the image-loader harness
-(16\,697 edges) illustrates how entry point selection determines instrumentation scope:
-the same library produces very different coverage maps depending on which subsystem the
-harness calls.
-
-\subsection{Map Density vs.\ Total Edges}
-
-The AFL++ status screen reports map density as $d = e_{\text{reached}} / e_{\text{total}}$.
-Not all instrumented edges are reachable from \texttt{sixel\_decode\_raw}: encoder
-paths, pixel-format converters, and write-side I/O routines are compiled in (if
-\texttt{--whole-archive} is used) but never called by the harness.
-Even among reachable edges, paths gated on rarely valid input sequences (e.g.,
-a fully valid HLS colour triple followed by a specific run-length token) may
-require many mutations to discover within 40 minutes.
-In the QEMU campaign the reported density (0.72\%) is an artifact of the fixed
-65\,536-slot map rather than a measure of real library coverage.
-
-\subsection{Exec Speed Under Three Configurations}
-
-\begin{center}
-\begin{tabular}{lc}
-\hline
-\textbf{Configuration} & \textbf{Exec speed (exec/s)} \\
-\hline
-No sanitizer, fork mode   & 542 \\
-ASan, fork mode          & 355 \\
-ASan, persistent mode    & 23\,717 \\
-\hline
-\end{tabular}
-\end{center}
-
-\textbf{No sanitizer $\to$ ASan, fork mode slowdown (542 $\to$ 355\,exec/s).}
-ASan inserts a shadow-memory check before every load and store, maintaining a
-$1/8$-address-space shadow map.
-This adds per-operation overhead and increases the process memory footprint,
-making each fork slightly more expensive and reducing throughput by $\approx$35\%.
-
-\textbf{Fork mode $\to$ persistent mode speedup (355 $\to$ 23\,717\,exec/s, $\approx$67$\times$).}
-In fork mode, AFL++ forks a new process for every test case, paying the cost of
-\texttt{fork(2)} and page-table copy-on-write on each execution.
-Persistent mode keeps the process alive and loops inside \texttt{\_\_AFL\_LOOP(1000)},
-amortising the fork cost over 1\,000 iterations.
-For a lightweight, stateless function like \texttt{sixel\_decode\_raw} where process
-startup dominates runtime, the speedup is at the high.
+\textbf{Three configurations} (Appendix~\ref{app:tables}, Table~\ref{tab:perf}):
+no-sanitizer fork 542\,exec/s, ASan fork 355, ASan persistent 23\,717.
+\emph{No-san $\to$ ASan fork ($\approx 35$\% slowdown):} ASan inserts a
+shadow-memory check before every load/store and maintains a 1/8-address-space
+shadow map; per-op overhead plus higher memory footprint make each fork more
+expensive. \emph{Fork $\to$ persistent ($\approx 67\times$ speedup):} fork mode
+pays \texttt{fork(2)} and CoW page-table copy on every case; persistent mode
+loops inside \texttt{\_\_AFL\_LOOP(1000)}, amortising fork cost over 1\,000
+iterations. For the lightweight stateless \texttt{sixel\_decode\_raw} where
+process startup dominates, the speedup sits at the top of the typical
+$2{-}20\times$ range --- here $\approx 67\times$.
 
 %-------------------------------------------------------------------------------
 \appendix
-\section*{Appendix: Screenshots and Plots}
-\label{app:screenshots}
 %-------------------------------------------------------------------------------
 
-Figures are placed here and do not count toward the 4-page body limit.
+% --- Tighten spacing throughout the appendix ---
+\setlength{\intextsep}{2pt plus 1pt minus 1pt}
+\setlength{\textfloatsep}{4pt plus 1pt minus 1pt}
+\setlength{\floatsep}{4pt plus 1pt minus 1pt}
+\setlength{\abovecaptionskip}{3pt}
+\setlength{\belowcaptionskip}{0pt}
 
-\begin{figure}[h]
+\makeatletter
+\renewcommand\section{\@startsection{section}{1}{\z@}%
+  {-2ex \@plus -0.5ex \@minus -.2ex}%
+  {0.8ex \@plus.2ex}%
+  {\normalfont\Large\bfseries}}
+\makeatother
+
+\section{Build Configurations}
+\label{app:builds}
+\vspace{-0.8em}
+
+\begin{table}[H]
+\centering\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llp{4.3cm}@{}}
+\toprule
+\textbf{Flag} & \textbf{B} & \textbf{Effect / if omitted} \\
+\midrule
+\texttt{CC=afl-clang-lto}    & 1    & AFL++ LTO: collision-free edge IDs. Without it, no coverage feedback. \\
+\texttt{CC=clang}            & 2    & Plain Clang. Required for \texttt{-Q}; compiler instrumentation conflicts with QEMU. \\
+\texttt{-fsanitize=address}  & 1    & ASan red-zones, shadow memory, quarantine (CFLAGS+LDFLAGS). Without: OOB/UAF silent. \\
+\texttt{-g}                  & 1,2  & DWARF info; else ASan shows raw addresses. \\
+\texttt{-O1}                 & 1,2  & Light opt; \texttt{-O0} bloats map, \texttt{-O2/O3} inlines too aggressively. \\
+\texttt{--disable-shared}    & 1    & Static lib. A \texttt{.so} bypasses AFL's shm map (0\% coverage). \\
+\texttt{--disable-python}    & 1,2  & Avoids \texttt{make install} failure on Python 3.12+ (removed \texttt{imp}). \\
+\bottomrule
+\end{tabular}
+\caption{Build flags. B1 = instrumented (AFL++ + ASan); B2 = vanilla (QEMU).}
+\label{tab:builds}
+\end{table}
+
+\section{SIXEL Dictionary}
+\label{app:dict}
+\vspace{-0.8em}
+
+\begin{figure}[H]
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize,numbers=none,caption={Contents of \texttt{sixel.dict}.},label={lst:dict}]
+header_pq="\x1bPq"   # DCS + 'q'
+header_p="\x1bP"     # DCS no mode byte
+terminator="\x1b\\"  # String Terminator
+color_intro="#"      # palette / color
+raster_attr="\""     # raster attr intro
+rle_intro="!"        # run-length intro
+graphics_cr="$"      # graphics CR
+graphics_nl="-"      # graphics newline
+param_sep=";"        # param separator
+\end{lstlisting}
+\end{figure}
+
+\section{Crash Triage --- ASan Trace and Minimisation}
+\label{app:crash}
+\vspace{-0.8em}
+
+\begin{figure}[H]
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize,numbers=none,caption={Crash reproduction (abridged) and \texttt{afl-tmin}.},label={lst:asan}]
+$ ./harness_load_image <crash>
+
+ERROR: AddressSanitizer: attempting free on
+ address which was not malloc()-ed:
+ #0 free (harness_load_image)
+ #1 load_png             loader.c:633
+ #2 load_with_builtin    loader.c:889
+ #3 sixel_helper_load..  loader.c:1418
+ #4 sixel_encoder_encode encoder.c:1743
+ #5 main           harness_load_image.c:16
+Alloc: malloc <- sixel_frame_new frame.c:61
+              <- load_with_builtin loader.c:885
+SUMMARY: bad-free in free
+
+$ afl-tmin -i <crash> -o out.png \
+    -- ./harness_load_image @@
+# 86.67% reduction (60 -> 8 bytes)
+\end{lstlisting}
+\end{figure}
+
+\section{Comparison and Performance Tables}
+\label{app:tables}
+\vspace{-0.8em}
+
+\begin{table}[H]
+\centering\footnotesize
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{Instr.} & \textbf{QEMU} \\
+\midrule
+Duration              & 40 min   & 40 min \\
+Exec speed (exec/s)   & 355      & 409    \\
+Edges discovered      & 469      & 463    \\
+Total edge map size   & 1\,065   & 65\,536\\
+Map density           & 44.04\%  & 0.71\% \\
+Corpus count          & 859      & 700    \\
+Cycles done           & 2        & 3      \\
+Saved crashes         & 0        & 0      \\
+\bottomrule
+\end{tabular}
+\caption{Instrumented vs.\ QEMU on \texttt{sixel\_decode\_raw}.}
+\label{tab:qemu}
+\end{table}
+
+\begin{table}[H]
+\centering\footnotesize
+\begin{tabular}{@{}lc@{}}
+\toprule
+\textbf{Configuration} & \textbf{exec/s} \\
+\midrule
+No sanitizer, fork mode & 542     \\
+ASan, fork mode         & 355     \\
+ASan, persistent mode   & 23\,717 \\
+\bottomrule
+\end{tabular}
+\caption{Throughput of \texttt{harness\_decode\_raw}.}
+\label{tab:perf}
+\end{table}
+
+\section{Screenshots and Plots}
+\label{app:plots}
+\vspace{-0.8em}
+
+\begin{figure}[H]
   \centering
   \includegraphics[width=\columnwidth]{plot_output/load_img_stats.png}
-  \caption{AFL++ status screen — \texttt{harness\_load\_image} campaign (crashes found).}
+  \caption{AFL++ status screen --- instrumented \texttt{load\_image} campaign.}
   \label{fig:afl-status}
 \end{figure}
 
-\begin{figure}[h]
+\begin{figure}[H]
   \centering
   \includegraphics[width=\columnwidth]{plot_output/load_image/edges.png}
-  \caption{\texttt{afl-plot} edges graph — \texttt{harness\_load\_image} campaign.}
+  \caption{\texttt{afl-plot} edges graph --- instrumented \texttt{load\_image} campaign.}
   \label{fig:edges}
 \end{figure}
 
-\begin{figure}[h]
+\begin{figure}[H]
   \centering
   \includegraphics[width=\columnwidth]{plot_output/qemu_stats.png}
-  \caption{AFL++ status screen — QEMU-mode campaign.}
+  \caption{AFL++ status screen --- QEMU-mode campaign.}
   \label{fig:afl-status-qemu}
 \end{figure}
 
-\begin{figure}[h]
+\begin{figure}[H]
   \centering
   \includegraphics[width=\columnwidth]{plot_output/qemu/edges.png}
-  \caption{\texttt{afl-plot} edges graph — QEMU-mode campaign.}
+  \caption{\texttt{afl-plot} edges graph --- QEMU-mode campaign.}
   \label{fig:edges-qemu}
 \end{figure}
 
@@ -634,6 +500,4 @@ Figures are placed here and do not count toward the 4-page body limit.
 \bibliographystyle{plain}
 \bibliography{\jobname}
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \end{document}
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
