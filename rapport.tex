@@ -23,7 +23,7 @@
 }
 
 %-------------------------------------------------------------------------------
-\begin{filecontents}{\jobname.bib}
+\begin{filecontents}[overwrite]{\jobname.bib}
 %-------------------------------------------------------------------------------
 @misc{libsixel,
   author = {Hayaki Saito},
@@ -37,10 +37,16 @@
   year   = 2023,
   note   = {\url{https://github.com/AFLplusplus/AFLplusplus}}
 }
-@misc{cve220,
-  title  = {libsixel {GH} issue \#220 --- heap-buffer-overflow in image\_buffer\_resize},
-  year   = 2021,
-  note   = {\url{https://github.com/saitoha/libsixel/issues/220}}
+@misc{issue177,
+  title  = {libsixel {GH} issue \#177},
+  year   = 2023,
+  note   = {\url{https://github.com/saitoha/libsixel/issues/177}}
+}
+@misc{ourimpl,
+  author = {Fedosov, Denis and Nicole, Robin and Picard, Antony and Kurz, Tizian},
+  title  = {CS-412 Software Security Lab 2 --- fuzzing campaign source},
+  year   = 2026,
+  note   = {\url{https://github.com/github-fed/softsec-lab2}}
 }
 \end{filecontents}
 
@@ -70,7 +76,8 @@ a C library that encodes and decodes SIXEL bitmap graphics. Using AFL++~\cite{af
 with AddressSanitizer, we fuzz multiple functions and compare results with a
 QEMU-mode black-box run on an uninstrumented binary. Our image-loading harness
 discovers a \texttt{bad-free} in \texttt{load\_png} reducible to an 8-byte PoC,
-matching upstream issue~\#220.
+matching upstream issue~\#177. All harnesses, seed corpora, and
+analysis scripts are publicly available~\cite{ourimpl}.
 \end{abstract}
 
 %-------------------------------------------------------------------------------
@@ -181,12 +188,10 @@ We focus on the image-loading campaign that found crashes
 (\texttt{harness\_vanilla}); both ran 40\,min on a single core. Status screens
 and edge plots: Appendix~\ref{app:plots}.
 
-\textbf{\texttt{harness\_load\_image} (crashes found).} Stability 100\% (fully
-deterministic); corpus 1\,318 inputs (1\,314 found by mutation), the largest
+\textbf{\texttt{harness\_load\_image} (crashes found).} Stability 100\%. Corpus 1\,318 inputs (1\,314 found by mutation), the largest
 campaign since PNG/JPEG/BMP parsing exposes far more branches than the pure
 decoder; map density 12.66\% (2\,114/16\,697), the large denominator including
-libpng, libjpeg and BMP code with paths requiring magic bytes the fuzzer had
-not yet synthesised; cycles done 0 (859 pending, 44 pending-favoured ---
+libpng, libjpeg and BMP, cycles done 0 (859 pending, 44 pending-favoured ---
 corpus still actively growing); 2 saved crashes, 8 hangs.
 \emph{Edges curve:} immediate sustained discovery --- 977 edges at $t=60$\,s,
 1\,065 at $t=156$\,s, 1\,221 at $t=376$\,s, 1\,384 at $t=580$\,s, 2\,114 at
@@ -236,9 +241,9 @@ value after the jump; the compiler may keep \texttt{rows} in a register that
 \texttt{cleanup} label, which calls \texttt{sixel\_allocator\_free(allocator,
 rows)} on that garbage pointer.
 
-\textbf{Classification.} ASan \texttt{bad-free}; CWE-825 (Expired Pointer
+\textbf{Classification.} ASan \texttt{bad-free}; CVE-2020-11721; CWE-825 (Expired Pointer
 Dereference --- indeterminate pointer after \texttt{longjmp}) with secondary
-CWE-755; matches the root cause of libsixel issue~\#220~\cite{cve220}
+CWE-755; matches the root cause of libsixel issue~\#177~\cite{issue177}
 (\texttt{heap-buffer-overflow} in the related PNG cleanup path, v1.8.6).
 
 %-------------------------------------------------------------------------------
@@ -323,9 +328,7 @@ $d = e_{\text{reached}}/e_{\text{total}}$. Not all instrumented edges are
 reachable from \texttt{sixel\_decode\_raw}: encoder paths, pixel-format
 converters and write-side I/O are compiled in (with \texttt{--whole-archive})
 but never called. Even among reachable edges, paths gated on rare valid
-sequences (e.g.\ a valid HLS triple followed by a specific run-length token)
-may need many mutations to discover within 40\,min. The QEMU density (0.72\%)
-is a fixed-map artefact, not a measure of real library coverage.
+sequences may need many mutations to discover within 40\,min.
 
 \textbf{Three configurations} (Appendix~\ref{app:tables}, Table~\ref{tab:perf}):
 no-sanitizer fork 542\,exec/s, ASan fork 355, ASan persistent 23\,717.
@@ -335,9 +338,7 @@ shadow map; per-op overhead plus higher memory footprint make each fork more
 expensive. \emph{Fork $\to$ persistent ($\approx 67\times$ speedup):} fork mode
 pays \texttt{fork(2)} and CoW page-table copy on every case; persistent mode
 loops inside \texttt{\_\_AFL\_LOOP(1000)}, amortising fork cost over 1\,000
-iterations. For the lightweight stateless \texttt{sixel\_decode\_raw} where
-process startup dominates, the speedup sits at the top of the typical
-$2{-}20\times$ range --- here $\approx 67\times$.
+iterations.
 
 %-------------------------------------------------------------------------------
 \appendix
